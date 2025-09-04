@@ -9,3 +9,4 @@ mod restore;
 mod tree_cache;
 mod update_proof;
 mod vectors;
+mod delta_multiproof_integration;

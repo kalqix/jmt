@@ -121,6 +121,7 @@ pub mod storage {
 
 #[cfg(any(test))]
 mod tests;
+mod multiproof;
 
 /// An error that occurs when the state root for a requested version is missing (e.g., because it was pruned).
 #[derive(Debug)]
