@@ -24,6 +24,73 @@ use crate::{KeyHash, RootHash, ValueHash, proof::{SparseMerkleNode, SparseMerkle
 pub type Path = Vec<u8>;
 
 #[inline]
+fn key_bit(key: &KeyHash, bit_idx: usize) -> u8 {
+    let byte = bit_idx / 8;
+    let off  = bit_idx % 8;
+    ((key.0[byte] >> (7 - off)) & 1) as u8
+}
+
+/// Raise a leaf hash up to `target_depth` (0=root ... 256=leaf) using placeholders
+/// along the path of `key`. Returns the node hash located at `target_depth`.
+fn raise_leaf_to_depth<H: SimpleHasher>(
+    mut h: [u8;32],
+    key: &KeyHash,
+    target_depth: usize,
+) -> [u8;32] {
+    assert!(target_depth <= 256);
+    for i in (target_depth..=255).rev() {
+        let b = key_bit(key, i);
+        h = if b == 0 {
+            hash_internal_from_parts::<H>(&h, &SPARSE_MERKLE_PLACEHOLDER_HASH)
+        } else {
+            hash_internal_from_parts::<H>(&SPARSE_MERKLE_PLACEHOLDER_HASH, &h)
+        };
+    }
+    h
+}
+
+/// Build the hash of the subtree rooted at `prefix_len` after inserting `new_key/new_leaf`
+/// into a subtree that currently contains exactly the conflicting leaf (`conf_key/conf_hash`).
+/// Build the subtree hash rooted at `prefix_len` after inserting `new_key/new_leaf`
+/// into a subtree that currently contains exactly the conflicting leaf (`conf_key/conf_leaf_hash`).
+/// JMT is compressed: a leaf can be a direct child at any depth, so at the first differing bit `d`
+/// the two children under depth `d` are simply the two leaf hashes.
+fn combined_subtree_after_insert<H: SimpleHasher>(
+    prefix_len: usize,
+    new_key: &KeyHash,
+    new_leaf_hash: [u8;32],
+    conf_key: &KeyHash,
+    conf_leaf_hash: [u8;32],
+) -> [u8;32] {
+    // 1) Find first differing bit d ≥ prefix_len
+    let mut d = prefix_len;
+    while d < 256 && key_bit(new_key, d) == key_bit(conf_key, d) {
+        d += 1;
+    }
+    debug_assert!(d < 256, "new and conflicting keys must differ after prefix");
+
+    // 2) At depth d: combine two leaf hashes directly (compressed SMT)
+    let mut h = if key_bit(new_key, d) == 0 {
+        // new goes left, conflicting goes right
+        hash_internal_from_parts::<H>(&new_leaf_hash, &conf_leaf_hash)
+    } else {
+        // new goes right, conflicting goes left
+        hash_internal_from_parts::<H>(&conf_leaf_hash, &new_leaf_hash)
+    };
+
+    // 3) Raise from depth d → prefix_len using placeholders along the shared path
+    for j in (prefix_len..d).rev() {
+        let b = key_bit(new_key, j); // (same as conf_key on shared prefix)
+        h = if b == 0 {
+            hash_internal_from_parts::<H>(&h, &SPARSE_MERKLE_PLACEHOLDER_HASH)
+        } else {
+            hash_internal_from_parts::<H>(&SPARSE_MERKLE_PLACEHOLDER_HASH, &h)
+        };
+    }
+    h
+}
+
+#[inline]
 pub fn path_len_bits(path: &Path) -> usize {
     if path.len() < 2 { return 0; }
     u16::from_le_bytes([path[0], path[1]]) as usize
@@ -119,6 +186,8 @@ pub struct DeltaLeaf {
     pub leaf_path: Path,                 // len_bits = siblings.len() from the (non-)inclusion proof
     pub old_value_hash: Option<[u8; 32]>,// None = key did not exist in R₀ (insert)
     pub new_value_hash: Option<[u8; 32]>,// None = key removed in Rƒ (delete)
+    pub old_base_at_leaf_path: Option<[u8; 32]>,
+    pub conflicting_key: Option<KeyHash>,        //key of conflicting leaf (if any)
 }
 
 #[derive(Clone)]
@@ -254,16 +323,32 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
     let mut new_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
 
     for dl in &proof.leaves {
-        // For R₀: if the key did not exist, use the placeholder at this leaf position.
-        let h_old = match dl.old_value_hash {
-            Some(vh) => hash_leaf_from_parts::<H>(&dl.key, &vh),
-            None     => SPARSE_MERKLE_PLACEHOLDER_HASH,
+        // OLD side @ leaf_path
+        let h_old = if let Some(vh) = dl.old_value_hash {
+            // update: old leaf existed under this prefix
+            hash_leaf_from_parts::<H>(&dl.key, &vh)
+        } else if let Some(base) = dl.old_base_at_leaf_path {
+            // non-inclusion (conflicting leaf variant): base under this prefix is that leaf
+            base
+        } else {
+            // non-inclusion (empty subtree variant)
+            SPARSE_MERKLE_PLACEHOLDER_HASH
         };
-        // For Rƒ: if the key is deleted, use the placeholder; else the new leaf hash.
-        let h_new = match dl.new_value_hash {
-            Some(vh) => hash_leaf_from_parts::<H>(&dl.key, &vh),
-            None     => SPARSE_MERKLE_PLACEHOLDER_HASH,
+
+        // NEW side @ leaf_path
+        let h_new = match (dl.new_value_hash, dl.old_base_at_leaf_path, dl.conflicting_key) {
+            // INSERT with conflicting leaf → build combined subtree under this prefix
+            (Some(vh_new), Some(conf_hash), Some(conf_key)) => {
+                let prefix_len = path_len_bits(&dl.leaf_path);
+                let new_leaf = hash_leaf_from_parts::<H>(&dl.key, &vh_new);
+                combined_subtree_after_insert::<H>(prefix_len, &dl.key, new_leaf, &conf_key, conf_hash)
+            }
+            // UPDATE or INSERT into empty subtree
+            (Some(vh_new), _, _) => hash_leaf_from_parts::<H>(&dl.key, &vh_new),
+            // DELETE
+            (None, _, _) => SPARSE_MERKLE_PLACEHOLDER_HASH,
         };
+
         if old_at.insert(dl.leaf_path.clone(), h_old).is_some() { return false; }
         if new_at.insert(dl.leaf_path.clone(), h_new).is_some() { return false; }
     }
