@@ -143,11 +143,11 @@ impl SparseMerkleLeafNode {
         }
     }
 
-    pub(crate) fn key_hash(&self) -> KeyHash {
+    pub fn key_hash(&self) -> KeyHash {
         self.key_hash
     }
 
-    pub(crate) fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
+    pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
         let mut hasher = H::new();
         hasher.update(LEAF_DOMAIN_SEPARATOR);
         hasher.update(&self.key_hash.0);

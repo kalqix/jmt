@@ -89,7 +89,7 @@ impl<H: SimpleHasher> SparseMerkleProof<H> {
     }
 
     /// Returns the list of siblings in this proof.
-    pub(crate) fn siblings(&self) -> &[SparseMerkleNode] {
+    pub fn siblings(&self) -> &[SparseMerkleNode] {
         &self.siblings
     }
 

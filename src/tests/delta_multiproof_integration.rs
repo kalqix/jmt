@@ -337,7 +337,6 @@ fn delta_multiproof_integration_kalqix() {
 
     let (rf, _writes1) = jmt.put_value_set(v1.clone(), 1).expect("commit v1");
 
-
     store.write_node_batch(&_writes1.node_batch).expect("commit v1");
 
     let mut single_delta_hosts = Vec::new();
