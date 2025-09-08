@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use hashbrown::HashMap;
 use proptest::bits::BitSetLike;
 use sha2::Sha256;
-use crate::{JellyfishMerkleTree, KeyHash, SimpleHasher};
+use crate::{JellyfishMerkleTree, KeyHash, SimpleHasher, ValueHash};
 use crate::mock::MockTreeStore;
 use crate::multiproof::{ encode_prefix_from_key, frames_from_single_proof_r0, verify_delta_multiproof, DeltaLeaf, DeltaMultiProof, InternalFrame, Path};
 use crate::writer::TreeWriter;
@@ -46,7 +46,7 @@ pub fn map_to_bytes_le(map: &HashMap<i32, i32>, deterministic: bool) -> Option<V
 }/// Convenience: compute JMT value hash the same way your crate does.
 fn value_hash(v: &[u8]) -> [u8; 32] {
     // Was: Sha256::hash(v)
-    crate::ValueHash::with::<Sha256>(v).0
+    ValueHash::with::<Sha256>(v).0
 }
 
 /// Host-side input for unioning multiple single proofs (all w.r.t. R0).
@@ -108,7 +108,11 @@ fn delta_multiproof_integration_pass() {
     v0.insert(k_alice, Some(v_alice_old.clone().to_vec()));
     v0.insert(k_bob,   Some(v_bob_old.clone().to_vec()));
     v0.insert(k_carol, Some(v_carol_old.clone().to_vec()));
-
+    println!("carol {:?}", v_carol_old.clone().to_vec());
+    println!("alice old {:?}", v_alice_old.clone().to_vec());
+    println!("bob old {:?}", v_bob_old.clone().to_vec());
+    println!("alice new {:?}", v_alice_new.clone().to_vec());
+    println!("bob new {:?}", v_bob_new.clone().to_vec());
     let (r0, tree_update_batch) = jmt.put_value_set(v0, 0).expect("commit v0");
     store.write_node_batch(&tree_update_batch.node_batch).expect("commit v0");
 
@@ -151,7 +155,21 @@ fn delta_multiproof_integration_pass() {
     v1.insert(k_alice, Some(v_alice_new.to_vec()));
     v1.insert(k_bob, Some(v_bob_new.to_vec()));
     let (rf, _writes1) = jmt.put_value_set(v1, 1).expect("commit v1");
+    store.write_node_batch(&_writes1.node_batch).expect("commit v0");
+    println!("alice {:?}", v_alice_new.clone().to_vec());
+    println!("bob {:?}", v_bob_new.clone().to_vec());
 
+    let a = jmt.get_with_proof(k_carol, 1).expect("proof A@R0");
+    println!("carol new {:?}", a.0);
+    let a = jmt.get_with_proof(k_alice, 1).expect("proof A@R0");
+    println!("alice new {:?}", a.0);
+    let a = jmt.get_with_proof(k_bob, 1).expect("proof A@R0");
+    println!("bob new {:?}", a.0);
+
+    let a = jmt.get_with_proof(k_alice, 0).expect("proof A@R0");
+    println!("alice old {:?}", a.0);
+    let a = jmt.get_with_proof(k_bob, 0).expect("proof A@R0");
+    println!("bob old {:?}", a.0);
     // 6) Verify the delta multiproof (should pass).
     assert!(
         verify_delta_multiproof::<Sha256>(&Sha256::new(), r0, rf, &delta),

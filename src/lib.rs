@@ -89,6 +89,8 @@ mod tree_cache;
 mod types;
 mod writer;
 
+mod multiproof;
+
 #[cfg(any(test, feature = "mocks"))]
 pub mod mock;
 pub mod restore;
@@ -104,6 +106,8 @@ pub use tree::Sha256Jmt;
 use types::nibble::ROOT_NIBBLE_HEIGHT;
 pub use types::proof;
 pub use types::Version;
+
+pub use multiproof::*;
 
 /// Contains types used to bridge a [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
 /// to the backing storage recording the tree's internal data.
@@ -121,7 +125,6 @@ pub mod storage {
 
 #[cfg(any(test))]
 mod tests;
-mod multiproof;
 
 /// An error that occurs when the state root for a requested version is missing (e.g., because it was pruned).
 #[derive(Debug)]
