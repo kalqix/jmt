@@ -3,9 +3,9 @@
 
 //! Merkle proof types.
 
-pub(crate) mod definition;
+pub mod definition;
 #[cfg(all(test, feature = "std"))]
-pub(crate) mod proptest_proof;
+pub mod proptest_proof;
 
 use crate::{
     proof::SparseMerkleNode::{Internal, Leaf},
@@ -35,7 +35,7 @@ pub const INTERNAL_DOMAIN_SEPARATOR: &[u8] = b"JMT::IntrnalNode";
 /// be able to forge the node/leaf type, as this assertion wouldn't be checked.
 /// Providing a [`SparseMerkleInternalNode`] or a [`SparseMerkleLeafNode`] structure is sufficient to
 /// prove the node type as one would need to reverse the hash function to forge them.
-pub(crate) enum SparseMerkleNode {
+pub enum SparseMerkleNode {
     // The default sparse node
     Null,
     // The internal sparse merkle tree node
@@ -45,7 +45,7 @@ pub(crate) enum SparseMerkleNode {
 }
 
 impl SparseMerkleNode {
-    pub(crate) fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
+    pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
         match self {
             SparseMerkleNode::Null => SPARSE_MERKLE_PLACEHOLDER_HASH,
             Internal(node) => node.hash::<H>(),
@@ -58,7 +58,7 @@ impl SparseMerkleNode {
     Serialize, Deserialize, Clone, Copy, Eq, PartialEq, BorshSerialize, BorshDeserialize, Debug,
 )]
 #[cfg_attr(all(test, feature = "std"), derive(Arbitrary))]
-pub(crate) struct SparseMerkleInternalNode {
+pub struct SparseMerkleInternalNode {
     left_child: [u8; 32],
     right_child: [u8; 32],
 }
@@ -136,7 +136,7 @@ impl PartialEq for SparseMerkleLeafNode {
 }
 
 impl SparseMerkleLeafNode {
-    pub(crate) fn new(key_hash: KeyHash, value_hash: ValueHash) -> Self {
+    pub fn new(key_hash: KeyHash, value_hash: ValueHash) -> Self {
         SparseMerkleLeafNode {
             key_hash,
             value_hash,
