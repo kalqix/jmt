@@ -293,8 +293,37 @@ fn normalize_frames(frames: &[InternalFrame]) -> CoreResult<Vec<InternalFrame>, 
     Ok(by_path.into_values().collect())
 }
 
-/// Verifies both roots using the same boundary frames.
-/// Returns true iff: old → R0 and new → Rf.
+/// Build the compressed-subtree root for a set of leaves under an anchor prefix.
+// If a subset has exactly 1 leaf, return that leaf hash (compressed SMT rule).
+fn subtree_root_for_keys<H: SimpleHasher>(
+    anchor_len: usize,
+    mut leaves: Vec<(KeyHash, [u8; 32])>,
+) -> [u8; 32] {
+    // dedup keys if present twice (e.g., conflicting key added separately)
+    use std::collections::BTreeMap;
+    let mut uniq: BTreeMap<KeyHash, [u8;32]> = BTreeMap::new();
+    for (k,h) in leaves.drain(..) { uniq.insert(k, h); }
+
+    fn build<H: SimpleHasher>(d: usize, items: &[(KeyHash, [u8;32])]) -> [u8;32] {
+        if items.len() == 1 {
+            return items[0].1;
+        }
+        let mut left: Vec<(KeyHash, [u8;32])> = Vec::new();
+        let mut right: Vec<(KeyHash, [u8;32])> = Vec::new();
+        for (k,h) in items {
+            if key_bit(k, d) == 0 { left.push((*k,*h)); } else { right.push((*k,*h)); }
+        }
+        let lh = if left.is_empty()  { SPARSE_MERKLE_PLACEHOLDER_HASH } else { build::<H>(d+1, &left) };
+        let rh = if right.is_empty() { SPARSE_MERKLE_PLACEHOLDER_HASH } else { build::<H>(d+1, &right) };
+        hash_internal_from_parts::<H>(&lh, &rh)
+    }
+
+    let pairs: Vec<(KeyHash, [u8;32])> = uniq.into_iter().collect();
+    if pairs.is_empty() { return SPARSE_MERKLE_PLACEHOLDER_HASH; }
+    if pairs.len() == 1 { return pairs[0].1; }
+    build::<H>(anchor_len, &pairs)
+}
+
 pub fn verify_delta_multiproof<H: SimpleHasher>(
     _hasher: &H,
     r0: RootHash,
@@ -305,21 +334,18 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         return false;
     }
 
-    // 0) Normalize/merge frames
+    // Normalize frames
     let mut frames = match normalize_frames(&proof.internals) {
         Ok(v) => v,
         Err(_) => return false,
     };
-
-    // 1) Deepest-first (longer path first), then lexicographic
     frames.sort_unstable_by(|a, b| {
         let la = path_len_bits(&a.node_path);
         let lb = path_len_bits(&b.node_path);
         lb.cmp(&la).then_with(|| a.node_path.cmp(&b.node_path))
     });
 
-    // 2) Precompute "new leaf" hashes for all keys that have new_value_hash.
-    //    This lets us lift the correct (new) hash for conflicting keys when they also change.
+    // Precompute "new leaf" hashes for keys that have new_value_hash (used for conflicting-key updates)
     let mut new_leaf_by_key: BTreeMap<KeyHash, [u8; 32]> = BTreeMap::new();
     for dl in &proof.leaves {
         if let Some(vh_new) = dl.new_value_hash {
@@ -327,47 +353,75 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         }
     }
 
-    // 3) Seed maps with leaf-level hashes (at exact leaf_path)
+    // Group delta leaves by leaf_path so we seed each anchor exactly once
+    let mut groups: BTreeMap<Path, Vec<&DeltaLeaf>> = BTreeMap::new();
+    for dl in &proof.leaves {
+        groups.entry(dl.leaf_path.clone()).or_default().push(dl);
+    }
+
+    // Seed OLD/NEW maps at each anchor (leaf_path)
     let mut old_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
     let mut new_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
 
-    for dl in &proof.leaves {
-        // OLD side @ leaf_path
-        let h_old = if let Some(vh) = dl.old_value_hash {
-            hash_leaf_from_parts::<H>(&dl.key, &vh)
-        } else if let Some(base) = dl.old_base_at_leaf_path {
-            base // conflicting-leaf variant of non-inclusion
+    for (leaf_path, dls) in groups {
+        let anchor_len = path_len_bits(&leaf_path);
+
+        // ----- OLD side leaves under this anchor -----
+        let mut old_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
+        let mut conf_key_opt: Option<KeyHash> = None;
+        let mut conf_old_hash_opt: Option<[u8;32]> = None;
+
+        for dl in &dls {
+            if let Some(vh_old) = dl.old_value_hash {
+                old_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_old)));
+            } else if let (Some(conf_hash), Some(conf_key)) = (dl.old_base_at_leaf_path, dl.conflicting_key) {
+                // Conflicting-leaf non-inclusion: the old subtree has exactly this leaf
+                if conf_key_opt.is_none() {
+                    conf_key_opt = Some(conf_key);
+                    conf_old_hash_opt = Some(conf_hash);
+                    old_pairs.push((conf_key, conf_hash));
+                }
+            } // empty-subtree variant contributes nothing to OLD
+        }
+
+        let h_old = if old_pairs.is_empty() {
+            SPARSE_MERKLE_PLACEHOLDER_HASH
+        } else if old_pairs.len() == 1 {
+            old_pairs[0].1
         } else {
-            SPARSE_MERKLE_PLACEHOLDER_HASH // empty-subtree variant
+            subtree_root_for_keys::<H>(anchor_len, old_pairs)
         };
 
-        // NEW side @ leaf_path
-        let h_new = match (dl.new_value_hash, dl.old_base_at_leaf_path, dl.conflicting_key) {
-            // INSERT with conflicting leaf → combine NEW leaf with conflicting leaf.
-            // If the conflicting key also changes in this batch, use its NEW hash; else use its OLD hash from the proof.
-            (Some(vh_new), Some(conf_old_hash), Some(conf_key)) => {
-                let conf_hash_for_new = new_leaf_by_key
-                    .get(&conf_key)
-                    .copied()
-                    .unwrap_or(conf_old_hash);
+        // ----- NEW side leaves under this anchor -----
+        let mut new_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
 
-                let prefix_len = path_len_bits(&dl.leaf_path);
-                let new_leaf   = hash_leaf_from_parts::<H>(&dl.key, &vh_new);
-                combined_subtree_after_insert::<H>(
-                    prefix_len, &dl.key, new_leaf, &conf_key, conf_hash_for_new
-                )
+        // If there was a conflicting leaf, include it with NEW hash if it also changed
+        if let (Some(conf_key), Some(conf_old_hash)) = (conf_key_opt, conf_old_hash_opt) {
+            let conf_new = new_leaf_by_key.get(&conf_key).copied().unwrap_or(conf_old_hash);
+            new_pairs.push((conf_key, conf_new));
+        }
+
+        for dl in &dls {
+            if let Some(vh_new) = dl.new_value_hash {
+                new_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_new)));
             }
-            // UPDATE, or INSERT into an empty-subtree
-            (Some(vh_new), _, _) => hash_leaf_from_parts::<H>(&dl.key, &vh_new),
-            // DELETE
-            (None, _, _) => SPARSE_MERKLE_PLACEHOLDER_HASH,
+            // if new_value_hash is None, it's a delete → contributes nothing
+        }
+
+        let h_new = if new_pairs.is_empty() {
+            SPARSE_MERKLE_PLACEHOLDER_HASH
+        } else if new_pairs.len() == 1 {
+            new_pairs[0].1
+        } else {
+            subtree_root_for_keys::<H>(anchor_len, new_pairs)
         };
 
-        if old_at.insert(dl.leaf_path.clone(), h_old).is_some() { return false; }
-        if new_at.insert(dl.leaf_path.clone(), h_new).is_some() { return false; }
+        // Insert exactly once per anchor (no collisions now)
+        if old_at.insert(leaf_path.clone(), h_old).is_some() { return false; }
+        if new_at.insert(leaf_path, h_new).is_some() { return false; }
     }
 
-    // 4) Bubble up using frames
+    // Bubble up with frames (unchanged)
     for fr in frames {
         let (lo, ro) = {
             let left  = match old_at.remove(&fr.left_path)  { Some(h) => h, None => match fr.left_outside_hash { Some(h) => h, None => return false } };
@@ -387,7 +441,6 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         if new_at.insert(fr.node_path, pn).is_some() { return false; }
     }
 
-    // 5) Must reduce to exactly one hash each, and match r0/rf
     fn singleton(map: &BTreeMap<Path, [u8; 32]>) -> Option<[u8; 32]> {
         let mut it = map.values();
         let h = *it.next()?;
