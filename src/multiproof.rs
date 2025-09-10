@@ -305,45 +305,59 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         return false;
     }
 
-    // Defensive: normalize/merge frames
+    // 0) Normalize/merge frames
     let mut frames = match normalize_frames(&proof.internals) {
         Ok(v) => v,
         Err(_) => return false,
     };
 
-    // Process deepest-first (longer path first), then lexicographic
+    // 1) Deepest-first (longer path first), then lexicographic
     frames.sort_unstable_by(|a, b| {
         let la = path_len_bits(&a.node_path);
         let lb = path_len_bits(&b.node_path);
         lb.cmp(&la).then_with(|| a.node_path.cmp(&b.node_path))
     });
 
-    // Place leaves at their exact leaf paths (depth = siblings.len())
+    // 2) Precompute "new leaf" hashes for all keys that have new_value_hash.
+    //    This lets us lift the correct (new) hash for conflicting keys when they also change.
+    let mut new_leaf_by_key: BTreeMap<KeyHash, [u8; 32]> = BTreeMap::new();
+    for dl in &proof.leaves {
+        if let Some(vh_new) = dl.new_value_hash {
+            new_leaf_by_key.insert(dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_new));
+        }
+    }
+
+    // 3) Seed maps with leaf-level hashes (at exact leaf_path)
     let mut old_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
     let mut new_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
 
     for dl in &proof.leaves {
         // OLD side @ leaf_path
         let h_old = if let Some(vh) = dl.old_value_hash {
-            // update: old leaf existed under this prefix
             hash_leaf_from_parts::<H>(&dl.key, &vh)
         } else if let Some(base) = dl.old_base_at_leaf_path {
-            // non-inclusion (conflicting leaf variant): base under this prefix is that leaf
-            base
+            base // conflicting-leaf variant of non-inclusion
         } else {
-            // non-inclusion (empty subtree variant)
-            SPARSE_MERKLE_PLACEHOLDER_HASH
+            SPARSE_MERKLE_PLACEHOLDER_HASH // empty-subtree variant
         };
 
         // NEW side @ leaf_path
         let h_new = match (dl.new_value_hash, dl.old_base_at_leaf_path, dl.conflicting_key) {
-            // INSERT with conflicting leaf → build combined subtree under this prefix
-            (Some(vh_new), Some(conf_hash), Some(conf_key)) => {
+            // INSERT with conflicting leaf → combine NEW leaf with conflicting leaf.
+            // If the conflicting key also changes in this batch, use its NEW hash; else use its OLD hash from the proof.
+            (Some(vh_new), Some(conf_old_hash), Some(conf_key)) => {
+                let conf_hash_for_new = new_leaf_by_key
+                    .get(&conf_key)
+                    .copied()
+                    .unwrap_or(conf_old_hash);
+
                 let prefix_len = path_len_bits(&dl.leaf_path);
-                let new_leaf = hash_leaf_from_parts::<H>(&dl.key, &vh_new);
-                combined_subtree_after_insert::<H>(prefix_len, &dl.key, new_leaf, &conf_key, conf_hash)
+                let new_leaf   = hash_leaf_from_parts::<H>(&dl.key, &vh_new);
+                combined_subtree_after_insert::<H>(
+                    prefix_len, &dl.key, new_leaf, &conf_key, conf_hash_for_new
+                )
             }
-            // UPDATE or INSERT into empty subtree
+            // UPDATE, or INSERT into an empty-subtree
             (Some(vh_new), _, _) => hash_leaf_from_parts::<H>(&dl.key, &vh_new),
             // DELETE
             (None, _, _) => SPARSE_MERKLE_PLACEHOLDER_HASH,
@@ -353,7 +367,7 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         if new_at.insert(dl.leaf_path.clone(), h_new).is_some() { return false; }
     }
 
-    // Bubble up parents using frames
+    // 4) Bubble up using frames
     for fr in frames {
         let (lo, ro) = {
             let left  = match old_at.remove(&fr.left_path)  { Some(h) => h, None => match fr.left_outside_hash { Some(h) => h, None => return false } };
@@ -373,7 +387,7 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         if new_at.insert(fr.node_path, pn).is_some() { return false; }
     }
 
-    // Must reduce to exactly one hash each (the root hash). We compare the hashes, not the path.
+    // 5) Must reduce to exactly one hash each, and match r0/rf
     fn singleton(map: &BTreeMap<Path, [u8; 32]>) -> Option<[u8; 32]> {
         let mut it = map.values();
         let h = *it.next()?;

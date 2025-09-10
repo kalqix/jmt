@@ -327,9 +327,11 @@ fn delta_multiproof_integration_kalqix() {
 
     // 5) Apply updates to get Rf: ONLY alice changes to 150.
     let mut v1 = BTreeMap::new();
+    let mut v1_hash = HashMap::new();
     for(key, value) in user_vs_balances.iter() {
         let v = map_to_bytes_le(value, false);
-        v1.insert(key.clone(), v);
+        v1.insert(key.clone(), v.clone());
+        v1_hash.insert(key.clone(), v);
     }
     let root = jmt.get_root_hash_option(1);
 
@@ -341,7 +343,7 @@ fn delta_multiproof_integration_kalqix() {
 
     let mut single_delta_hosts = Vec::new();
 
-    for(key, value) in v1.iter() {
+    for(key, value) in v1_hash.iter() {
         let (val_old, proof) = jmt.get_with_proof(*key, 0).expect("proof A@R0");
         let (frames, l_bits) = frames_from_single_proof_r0::<Sha256>(*key, proof.siblings());
         proof.verify(r0, *key, val_old.clone()).expect("verification failed");
