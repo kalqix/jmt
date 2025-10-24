@@ -9,7 +9,7 @@ use core::{cmp::Ordering, convert::TryInto};
 use hashbrown::HashMap;
 #[cfg(feature = "std")]
 use std::collections::HashMap;
-
+use tracing::info;
 use crate::proof::definition::UpdateMerkleProof;
 use crate::proof::{SparseMerkleLeafNode, SparseMerkleNode};
 use crate::{
@@ -429,6 +429,7 @@ where
         let mut tree_cache = TreeCache::new(self.reader, first_version)?;
         for (idx, value_set) in value_sets.into_iter().enumerate() {
             let version = first_version + idx as u64;
+            info!("put_value_set version: {}", version);
             for (i, (key, value)) in value_set.into_iter().enumerate() {
                 let action = if value.is_some() { "insert" } else { "delete" };
                 let value_hash = value.as_ref().map(|v| ValueHash::with::<H>(v));
