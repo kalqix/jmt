@@ -39,6 +39,61 @@ pub enum DeltaVerifyError {
     RootMismatch { got_old: [u8;32], want_old: [u8;32], got_new: [u8;32], want_new: [u8;32] },
 }
 
+fn path_is_prefix(prefix: &Path, longer: &Path) -> bool {
+    let lp = path_len_bits(prefix);
+    let ll = path_len_bits(longer);
+    if lp > ll { return false; }
+    // Compare the bytes that carry the prefix bits
+    let nbytes = (lp + 7) / 8;
+    if nbytes == 0 { return true; }
+    let mut ok = true;
+    for i in 0..nbytes {
+        let pb = prefix[2+i];
+        let lb = longer[2+i];
+        let same = if i + 1 < nbytes {
+            pb == lb
+        } else {
+            // last (partial) byte: mask off trailing bits
+            let keep_high = 0xFFu8 << ((nbytes*8) - lp);
+            (pb & keep_high) == (lb & keep_high)
+        };
+        ok &= same;
+    }
+    ok
+}
+
+fn side_has_union(node_path: &Path, left_path: &Path, right_path: &Path, leaf_paths: &[Path]) -> (bool, bool) {
+    let mut has_left = false;
+    let mut has_right = false;
+    for lp in leaf_paths {
+        if path_is_prefix(left_path,  lp) { has_left  = true; }
+        if path_is_prefix(right_path, lp) { has_right = true; }
+        if has_left && has_right { break; }
+    }
+    (has_left, has_right)
+}
+
+fn scrub_outside_hashes_with_leaf_paths(
+    mut frames: Vec<InternalFrame>,
+    leaf_paths: &[Path],
+) -> Vec<InternalFrame> {
+    for fr in frames.iter_mut() {
+        // if any leaf_path is under left_path, that side is "in union"
+        let mut left_has_union  = false;
+        let mut right_has_union = false;
+
+        for lp in leaf_paths {
+            if path_is_prefix(&fr.left_path,  lp) { left_has_union  = true; }
+            if path_is_prefix(&fr.right_path, lp) { right_has_union = true; }
+            if left_has_union && right_has_union { break; }
+        }
+
+        if left_has_union  { fr.left_outside_hash  = None; }
+        if right_has_union { fr.right_outside_hash = None; }
+    }
+    frames
+}
+
 #[inline]
 fn key_bit(key: &KeyHash, bit_idx: usize) -> u8 {
     let byte = bit_idx / 8;
@@ -299,6 +354,10 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         let lb = bits(&b.node_path);
         lb.cmp(&la).then_with(|| a.node_path.cmp(&b.node_path))
     });
+
+    // NEW: collect leaf_paths and scrub
+    let leaf_paths: Vec<Path> = proof.leaves.iter().map(|dl| dl.leaf_path.clone()).collect();
+    frames = scrub_outside_hashes_with_leaf_paths(frames, &leaf_paths);
 
     // Precompute NEW leaf hashes for keys that have new_value_hash (used when the conflicting key also updates).
     use std::collections::BTreeMap;
