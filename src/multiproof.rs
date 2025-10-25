@@ -23,6 +23,22 @@ use crate::{KeyHash, RootHash, ValueHash, proof::{SparseMerkleNode, SparseMerkle
 
 pub type Path = Vec<u8>;
 
+#[derive(Debug)]
+pub enum DeltaVerifyError {
+    EmptyProof,
+    FrameNormalization,
+    // We tried to seed the same anchor twice (shouldn't happen with grouping).
+    SeedCollision { path_bits: usize },
+    // A frame expected a child that was neither seeded (in-union) nor provided as an outside hash.
+    MissingChildOld { parent_bits: usize, which: &'static str },
+    MissingChildNew { parent_bits: usize, which: &'static str },
+    // After bubbling we didn't reduce to a single hash.
+    MultiRootOld(usize),
+    MultiRootNew(usize),
+    // Final roots didn't match the expected ones.
+    RootMismatch { got_old: [u8;32], want_old: [u8;32], got_new: [u8;32], want_new: [u8;32] },
+}
+
 #[inline]
 fn key_bit(key: &KeyHash, bit_idx: usize) -> u8 {
     let byte = bit_idx / 8;
@@ -30,65 +46,7 @@ fn key_bit(key: &KeyHash, bit_idx: usize) -> u8 {
     ((key.0[byte] >> (7 - off)) & 1) as u8
 }
 
-/// Raise a leaf hash up to `target_depth` (0=root ... 256=leaf) using placeholders
-/// along the path of `key`. Returns the node hash located at `target_depth`.
-fn raise_leaf_to_depth<H: SimpleHasher>(
-    mut h: [u8;32],
-    key: &KeyHash,
-    target_depth: usize,
-) -> [u8;32] {
-    assert!(target_depth <= 256);
-    for i in (target_depth..=255).rev() {
-        let b = key_bit(key, i);
-        h = if b == 0 {
-            hash_internal_from_parts::<H>(&h, &SPARSE_MERKLE_PLACEHOLDER_HASH)
-        } else {
-            hash_internal_from_parts::<H>(&SPARSE_MERKLE_PLACEHOLDER_HASH, &h)
-        };
-    }
-    h
-}
-
-/// Build the hash of the subtree rooted at `prefix_len` after inserting `new_key/new_leaf`
-/// into a subtree that currently contains exactly the conflicting leaf (`conf_key/conf_hash`).
-/// Build the subtree hash rooted at `prefix_len` after inserting `new_key/new_leaf`
-/// into a subtree that currently contains exactly the conflicting leaf (`conf_key/conf_leaf_hash`).
-/// JMT is compressed: a leaf can be a direct child at any depth, so at the first differing bit `d`
-/// the two children under depth `d` are simply the two leaf hashes.
-fn combined_subtree_after_insert<H: SimpleHasher>(
-    prefix_len: usize,
-    new_key: &KeyHash,
-    new_leaf_hash: [u8;32],
-    conf_key: &KeyHash,
-    conf_leaf_hash: [u8;32],
-) -> [u8;32] {
-    // 1) Find first differing bit d ≥ prefix_len
-    let mut d = prefix_len;
-    while d < 256 && key_bit(new_key, d) == key_bit(conf_key, d) {
-        d += 1;
-    }
-    debug_assert!(d < 256, "new and conflicting keys must differ after prefix");
-
-    // 2) At depth d: combine two leaf hashes directly (compressed SMT)
-    let mut h = if key_bit(new_key, d) == 0 {
-        // new goes left, conflicting goes right
-        hash_internal_from_parts::<H>(&new_leaf_hash, &conf_leaf_hash)
-    } else {
-        // new goes right, conflicting goes left
-        hash_internal_from_parts::<H>(&conf_leaf_hash, &new_leaf_hash)
-    };
-
-    // 3) Raise from depth d → prefix_len using placeholders along the shared path
-    for j in (prefix_len..d).rev() {
-        let b = key_bit(new_key, j); // (same as conf_key on shared prefix)
-        h = if b == 0 {
-            hash_internal_from_parts::<H>(&h, &SPARSE_MERKLE_PLACEHOLDER_HASH)
-        } else {
-            hash_internal_from_parts::<H>(&SPARSE_MERKLE_PLACEHOLDER_HASH, &h)
-        };
-    }
-    h
-}
+fn bits(path: &Path) -> usize { path_len_bits(path) }
 
 #[inline]
 pub fn path_len_bits(path: &Path) -> usize {
@@ -324,28 +282,26 @@ fn subtree_root_for_keys<H: SimpleHasher>(
     build::<H>(anchor_len, &pairs)
 }
 
-pub fn verify_delta_multiproof<H: SimpleHasher>(
+pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
     _hasher: &H,
     r0: RootHash,
     rf: RootHash,
     proof: &DeltaMultiProof,
-) -> bool {
+) -> Result<(), DeltaVerifyError> {
     if proof.leaves.is_empty() {
-        return false;
+        return Err(DeltaVerifyError::EmptyProof);
     }
 
-    // Normalize frames
-    let mut frames = match normalize_frames(&proof.internals) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    // 1) Normalize frames (merge duplicates; zero out outside-hash sides that are in-union).
+    let mut frames = normalize_frames(&proof.internals).map_err(|_| DeltaVerifyError::FrameNormalization)?;
     frames.sort_unstable_by(|a, b| {
-        let la = path_len_bits(&a.node_path);
-        let lb = path_len_bits(&b.node_path);
+        let la = bits(&a.node_path);
+        let lb = bits(&b.node_path);
         lb.cmp(&la).then_with(|| a.node_path.cmp(&b.node_path))
     });
 
-    // Precompute "new leaf" hashes for keys that have new_value_hash (used for conflicting-key updates)
+    // Precompute NEW leaf hashes for keys that have new_value_hash (used when the conflicting key also updates).
+    use std::collections::BTreeMap;
     let mut new_leaf_by_key: BTreeMap<KeyHash, [u8; 32]> = BTreeMap::new();
     for dl in &proof.leaves {
         if let Some(vh_new) = dl.new_value_hash {
@@ -353,35 +309,36 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
         }
     }
 
-    // Group delta leaves by leaf_path so we seed each anchor exactly once
+    // Group by anchor (leaf_path).
     let mut groups: BTreeMap<Path, Vec<&DeltaLeaf>> = BTreeMap::new();
     for dl in &proof.leaves {
         groups.entry(dl.leaf_path.clone()).or_default().push(dl);
     }
 
-    // Seed OLD/NEW maps at each anchor (leaf_path)
+    // 2) Seed anchors: compute OLD/NEW subtree roots under each anchor exactly once.
     let mut old_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
     let mut new_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
 
     for (leaf_path, dls) in groups {
-        let anchor_len = path_len_bits(&leaf_path);
+        let anchor_len = bits(&leaf_path);
 
-        // ----- OLD side leaves under this anchor -----
+        // OLD
         let mut old_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
-        let mut conf_key_opt: Option<KeyHash> = None;
-        let mut conf_old_hash_opt: Option<[u8;32]> = None;
+        let mut conf_key: Option<KeyHash> = None;
+        let mut conf_old: Option<[u8;32]> = None;
 
         for dl in &dls {
             if let Some(vh_old) = dl.old_value_hash {
                 old_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_old)));
-            } else if let (Some(conf_hash), Some(conf_key)) = (dl.old_base_at_leaf_path, dl.conflicting_key) {
-                // Conflicting-leaf non-inclusion: the old subtree has exactly this leaf
-                if conf_key_opt.is_none() {
-                    conf_key_opt = Some(conf_key);
-                    conf_old_hash_opt = Some(conf_hash);
-                    old_pairs.push((conf_key, conf_hash));
+            } else if let (Some(base), Some(kc)) = (dl.old_base_at_leaf_path, dl.conflicting_key) {
+                // only add the conflicting leaf once per anchor
+                if conf_key.is_none() {
+                    conf_key = Some(kc);
+                    conf_old = Some(base);
+                    old_pairs.push((kc, base));
                 }
-            } // empty-subtree variant contributes nothing to OLD
+            }
+            // empty-subtree variant contributes nothing to OLD
         }
 
         let h_old = if old_pairs.is_empty() {
@@ -392,20 +349,19 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
             subtree_root_for_keys::<H>(anchor_len, old_pairs)
         };
 
-        // ----- NEW side leaves under this anchor -----
+        // NEW
         let mut new_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
 
-        // If there was a conflicting leaf, include it with NEW hash if it also changed
-        if let (Some(conf_key), Some(conf_old_hash)) = (conf_key_opt, conf_old_hash_opt) {
-            let conf_new = new_leaf_by_key.get(&conf_key).copied().unwrap_or(conf_old_hash);
-            new_pairs.push((conf_key, conf_new));
+        // If a conflicting leaf existed at OLD, include it at NEW with updated hash if it changed.
+        if let (Some(kc), Some(hc_old)) = (conf_key, conf_old) {
+            let hc_new = new_leaf_by_key.get(&kc).copied().unwrap_or(hc_old);
+            new_pairs.push((kc, hc_new));
         }
-
         for dl in &dls {
             if let Some(vh_new) = dl.new_value_hash {
                 new_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_new)));
             }
-            // if new_value_hash is None, it's a delete → contributes nothing
+            // delete contributes nothing
         }
 
         let h_new = if new_pairs.is_empty() {
@@ -416,40 +372,78 @@ pub fn verify_delta_multiproof<H: SimpleHasher>(
             subtree_root_for_keys::<H>(anchor_len, new_pairs)
         };
 
-        // Insert exactly once per anchor (no collisions now)
-        if old_at.insert(leaf_path.clone(), h_old).is_some() { return false; }
-        if new_at.insert(leaf_path, h_new).is_some() { return false; }
+        if old_at.insert(leaf_path.clone(), h_old).is_some() {
+            return Err(DeltaVerifyError::SeedCollision { path_bits: anchor_len });
+        }
+        if new_at.insert(leaf_path, h_new).is_some() {
+            return Err(DeltaVerifyError::SeedCollision { path_bits: anchor_len });
+        }
     }
 
-    // Bubble up with frames (unchanged)
+    // 3) Bubble up along frames using the same boundaries for OLD and NEW.
     for fr in frames {
-        let (lo, ro) = {
-            let left  = match old_at.remove(&fr.left_path)  { Some(h) => h, None => match fr.left_outside_hash { Some(h) => h, None => return false } };
-            let right = match old_at.remove(&fr.right_path) { Some(h) => h, None => match fr.right_outside_hash { Some(h) => h, None => return false } };
-            (left, right)
+        let pb = bits(&fr.node_path);
+
+        // OLD
+        let lo = if let Some(h) = old_at.remove(&fr.left_path) {
+            h
+        } else if let Some(h) = fr.left_outside_hash {
+            h
+        } else {
+            return Err(DeltaVerifyError::MissingChildOld { parent_bits: pb, which: "left" });
         };
-        let (ln, rn) = {
-            let left  = match new_at.remove(&fr.left_path)  { Some(h) => h, None => match fr.left_outside_hash { Some(h) => h, None => return false } };
-            let right = match new_at.remove(&fr.right_path) { Some(h) => h, None => match fr.right_outside_hash { Some(h) => h, None => return false } };
-            (left, right)
+        let ro = if let Some(h) = old_at.remove(&fr.right_path) {
+            h
+        } else if let Some(h) = fr.right_outside_hash {
+            h
+        } else {
+            return Err(DeltaVerifyError::MissingChildOld { parent_bits: pb, which: "right" });
+        };
+
+        // NEW
+        let ln = if let Some(h) = new_at.remove(&fr.left_path) {
+            h
+        } else if let Some(h) = fr.left_outside_hash {
+            h
+        } else {
+            return Err(DeltaVerifyError::MissingChildNew { parent_bits: pb, which: "left" });
+        };
+        let rn = if let Some(h) = new_at.remove(&fr.right_path) {
+            h
+        } else if let Some(h) = fr.right_outside_hash {
+            h
+        } else {
+            return Err(DeltaVerifyError::MissingChildNew { parent_bits: pb, which: "right" });
         };
 
         let po = hash_internal_from_parts::<H>(&lo, &ro);
         let pn = hash_internal_from_parts::<H>(&ln, &rn);
 
-        if old_at.insert(fr.node_path.clone(), po).is_some() { return false; }
-        if new_at.insert(fr.node_path, pn).is_some() { return false; }
+        old_at.insert(fr.node_path.clone(), po);
+        new_at.insert(fr.node_path, pn);
     }
 
+    // 4) Singletons + root check
     fn singleton(map: &BTreeMap<Path, [u8; 32]>) -> Option<[u8; 32]> {
         let mut it = map.values();
         let h = *it.next()?;
         if it.next().is_some() { return None; }
         Some(h)
     }
-
-    match (singleton(&old_at), singleton(&new_at)) {
-        (Some(h0), Some(hf)) => h0 == r0.0 && hf == rf.0,
-        _ => false,
+    let h0 = singleton(&old_at).ok_or_else(|| DeltaVerifyError::MultiRootOld(old_at.len()))?;
+    let hf = singleton(&new_at).ok_or_else(|| DeltaVerifyError::MultiRootNew(new_at.len()))?;
+    if h0 != r0.0 || hf != rf.0 {
+        return Err(DeltaVerifyError::RootMismatch { got_old: h0, want_old: r0.0, got_new: hf, want_new: rf.0 });
     }
+    Ok(())
+}
+
+// Keep a bool wrapper if you like:
+pub fn verify_delta_multiproof<H: SimpleHasher>(
+    hasher: &H,
+    r0: RootHash,
+    rf: RootHash,
+    proof: &DeltaMultiProof,
+) -> bool {
+    verify_delta_multiproof_debug::<H>(hasher, r0, rf, proof).is_ok()
 }
