@@ -186,7 +186,7 @@ pub fn node_hash_bytes<H: SimpleHasher>(n: &SparseMerkleNode) -> [u8; 32] {
 
 /// Leaf node hash from (key, value_hash) using crate’s domain separation.
 #[inline]
-fn hash_leaf_from_parts<H: SimpleHasher>(key: &KeyHash, value_hash: &[u8; 32]) -> [u8; 32] {
+pub fn hash_leaf_from_parts<H: SimpleHasher>(key: &KeyHash, value_hash: &[u8; 32]) -> [u8; 32] {
     SparseMerkleLeafNode::new(*key, ValueHash(*value_hash)).hash::<H>()
 }
 
