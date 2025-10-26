@@ -12,7 +12,6 @@ license = "Apache-2.0"
 edition = "2021"
 
 keywords = ["merkle-tree", "authenticated"]
-category = ["cryptography", "data-structures"]
 publish = true
 
 [features]

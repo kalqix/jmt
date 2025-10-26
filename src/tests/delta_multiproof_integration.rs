@@ -13,7 +13,7 @@ use proptest::bits::BitSetLike;
 use sha2::Sha256;
 use crate::{JellyfishMerkleTree, KeyHash, SimpleHasher, ValueHash};
 use crate::mock::MockTreeStore;
-use crate::multiproof::{ encode_prefix_from_key, frames_from_single_proof_r0, verify_delta_multiproof, DeltaLeaf, DeltaMultiProof, InternalFrame, Path};
+use crate::multiproof::{ encode_prefix_from_key, frames_from_single_proof_r0, verify_delta_multiproof_debug, DeltaLeaf, DeltaMultiProof, InternalFrame, Path};
 use crate::writer::TreeWriter;
 
 /// ---- Helpers to map single proofs -> InternalFrames (R0) --------------------
@@ -170,11 +170,12 @@ fn delta_multiproof_integration_pass() {
     println!("alice old {:?}", a.0);
     let a = jmt.get_with_proof(k_bob, 0).expect("proof A@R0");
     println!("bob old {:?}", a.0);
+    verify_delta_multiproof_debug::<Sha256>(&Sha256::new(), r0, rf, &delta).unwrap();
     // 6) Verify the delta multiproof (should pass).
-    assert!(
-        verify_delta_multiproof::<Sha256>(&Sha256::new(), r0, rf, &delta),
+    /*assert!(
+        ,
         "delta multiproof should verify but did not"
-    );
+    );*/
 }
 
 #[test]
@@ -261,9 +262,9 @@ fn delta_multiproof_integration_none_pass() {
     store.write_node_batch(&_writes1.node_batch).expect("commit v1");
 
 
-    let ok = verify_delta_multiproof::<Sha256>(&Sha256::new(), r0, rf, &delta);
-    println!("verify_delta_multiproof: {}", ok);
-    assert!(ok, "delta multiproof should verify but did not");
+    let ok = verify_delta_multiproof_debug::<Sha256>(&Sha256::new(), r0, rf, &delta).unwrap();
+    //println!("verify_delta_multiproof_debug: {}", ok);
+    //assert!(ok, "delta multiproof should verify but did not");
 }
 
 #[test]
@@ -382,9 +383,9 @@ fn delta_multiproof_integration_kalqix() {
 
     println!("root at version 1 after: {:?}", root);
 
-    let ok = verify_delta_multiproof::<Sha256>(&Sha256::new(), r0, rf, &delta);
-    println!("verify_delta_multiproof: {}", ok);
-    assert!(ok, "delta multiproof should verify but did not");
+    let ok = verify_delta_multiproof_debug::<Sha256>(&Sha256::new(), r0, rf, &delta).unwrap();
+    //println!("verify_delta_multiproof_debug: {}", ok);
+    //assert!(ok, "delta multiproof should verify but did not");
 }
 
 #[test]
@@ -446,11 +447,11 @@ fn delta_multiproof_integration_fails_if_unrelated_key_changed() {
     v1.insert(k_bob, Some(v_bob_new.to_vec())); // intended change
     v1.insert(k_carol, Some(v_carol_new.to_vec())); // malicious/unrelated change
     let (rf_bad, _) = jmt.put_value_set(v1, 1).expect("commit v1_bad");
-
+    verify_delta_multiproof_debug::<Sha256>(&Sha256::new(), r0, rf_bad, &delta).unwrap_err();
     // The delta proof should FAIL, because we reused boundary siblings from R0
     // and they cannot produce rf_bad if Carol's subtree changed.
-    assert!(
-        !verify_delta_multiproof::<Sha256>(&Sha256::new(), r0, rf_bad, &delta),
+    /*assert!(
+        !,
         "delta multiproof should fail when unrelated key changed"
-    );
+    );*/
 }

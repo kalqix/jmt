@@ -27,6 +27,8 @@ pub type Path = Vec<u8>;
 pub enum DeltaVerifyError {
     EmptyProof,
     FrameNormalization,
+    MultipleConflictingKeys,
+    InvalidOutsideHash { path_bits: usize, which: &'static str },
     // We tried to seed the same anchor twice (shouldn't happen with grouping).
     SeedCollision { path_bits: usize },
     // A frame expected a child that was neither seeded (in-union) nor provided as an outside hash.
@@ -37,6 +39,13 @@ pub enum DeltaVerifyError {
     MultiRootNew(usize),
     // Final roots didn't match the expected ones.
     RootMismatch { got_old: [u8;32], want_old: [u8;32], got_new: [u8;32], want_new: [u8;32] },
+}
+
+fn singleton(map: &BTreeMap<Path, [u8; 32]>) -> Option<[u8; 32]> {
+    let mut it = map.values();
+    let h = *it.next()?;
+    if it.next().is_some() { return None; }
+    Some(h)
 }
 
 fn path_is_prefix(prefix: &Path, longer: &Path) -> bool {
@@ -343,46 +352,50 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
     rf: RootHash,
     proof: &DeltaMultiProof,
 ) -> Result<(), DeltaVerifyError> {
-    if proof.leaves.is_empty() {
-        return Err(DeltaVerifyError::EmptyProof);
-    }
+    if proof.leaves.is_empty() { return Err(DeltaVerifyError::EmptyProof); }
 
-    // 1) Normalize frames (merge duplicates; zero out outside-hash sides that are in-union).
-    let mut frames = normalize_frames(&proof.internals).map_err(|_| DeltaVerifyError::FrameNormalization)?;
-    frames.sort_unstable_by(|a, b| {
-        let la = bits(&a.node_path);
-        let lb = bits(&b.node_path);
-        lb.cmp(&la).then_with(|| a.node_path.cmp(&b.node_path))
-    });
-
-    // NEW: collect leaf_paths and scrub
-    let leaf_paths: Vec<Path> = proof.leaves.iter().map(|dl| dl.leaf_path.clone()).collect();
-    frames = scrub_outside_hashes_with_leaf_paths(frames, &leaf_paths);
-
-    // Precompute NEW leaf hashes for keys that have new_value_hash (used when the conflicting key also updates).
-    use std::collections::BTreeMap;
-    let mut new_leaf_by_key: BTreeMap<KeyHash, [u8; 32]> = BTreeMap::new();
+    // Validate conflicting keys and input consistency
+    let mut path_to_conf_key: BTreeMap<Path, Option<KeyHash>> = BTreeMap::new();
     for dl in &proof.leaves {
-        if let Some(vh_new) = dl.new_value_hash {
-            new_leaf_by_key.insert(dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_new));
+        if let Some(kc) = dl.conflicting_key {
+            let entry = path_to_conf_key.entry(dl.leaf_path.clone()).or_insert(None);
+            if *entry == None { *entry = Some(kc); }
+            else if *entry != Some(kc) { return Err(DeltaVerifyError::MultipleConflictingKeys); }
+        }
+        if dl.old_value_hash.is_none() && dl.conflicting_key.is_none() && dl.old_base_at_leaf_path.is_some() {
+            return Err(DeltaVerifyError::InvalidOutsideHash { path_bits: bits(&dl.leaf_path), which: "base" });
         }
     }
 
-    // Group by anchor (leaf_path).
+    // Normalize and scrub frames
+    let mut frames = normalize_frames(&proof.internals).map_err(|_| DeltaVerifyError::FrameNormalization)?;
+    frames.sort_unstable_by(|a, b| bits(&b.node_path).cmp(&bits(&a.node_path)));
+    let leaf_paths: Vec<Path> = proof.leaves.iter().map(|dl| dl.leaf_path.clone()).collect();
+    frames = scrub_outside_hashes_with_leaf_paths(frames, &leaf_paths);
+
+    // Precompute new leaf hashes
+    let mut new_leaf_by_key: BTreeMap<KeyHash, [u8; 32]> = BTreeMap::new();
+    for dl in &proof.leaves {
+        if let Some(vh_new) = dl.new_value_hash {
+            let new_hash = hash_leaf_from_parts::<H>(&dl.key, &vh_new);
+            new_leaf_by_key.insert(dl.key, new_hash);
+            println!("Key: {:02x?}, New leaf hash: {:02x?}", dl.key.0, new_hash);
+        }
+    }
+
+    // Group and seed anchors
     let mut groups: BTreeMap<Path, Vec<&DeltaLeaf>> = BTreeMap::new();
     for dl in &proof.leaves {
         groups.entry(dl.leaf_path.clone()).or_default().push(dl);
     }
 
-    // 2) Seed anchors: compute OLD/NEW subtree roots under each anchor exactly once.
     let mut old_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
     let mut new_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
 
     for (leaf_path, dls) in groups {
         let anchor_len = bits(&leaf_path);
-
-        // OLD
         let mut old_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
+        let mut new_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
         let mut conf_key: Option<KeyHash> = None;
         let mut conf_old: Option<[u8;32]> = None;
 
@@ -390,7 +403,7 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
             if let Some(vh_old) = dl.old_value_hash {
                 old_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_old)));
             } else if let (Some(base), Some(kc)) = (dl.old_base_at_leaf_path, dl.conflicting_key) {
-                // only add the conflicting leaf once per anchor
+                // Only add the conflicting leaf once per anchor
                 if conf_key.is_none() {
                     conf_key = Some(kc);
                     conf_old = Some(base);
@@ -399,6 +412,8 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
             }
             // empty-subtree variant contributes nothing to OLD
         }
+
+        let r_old_pairs = old_pairs.clone();
 
         let h_old = if old_pairs.is_empty() {
             SPARSE_MERKLE_PLACEHOLDER_HASH
@@ -423,6 +438,7 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
             // delete contributes nothing
         }
 
+        let r_new_pairs = new_pairs.clone();
         let h_new = if new_pairs.is_empty() {
             SPARSE_MERKLE_PLACEHOLDER_HASH
         } else if new_pairs.len() == 1 {
@@ -430,6 +446,10 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         } else {
             subtree_root_for_keys::<H>(anchor_len, new_pairs)
         };
+
+        println!("Anchor: {:02x?}, Old pairs: {:?}", leaf_path.clone(), r_old_pairs);
+        println!("Anchor: {:02x?}, New pairs: {:?}", leaf_path.clone(), r_new_pairs);
+        println!("Old: {:02x?}, New: {:02x?}", h_old, h_new);
 
         if old_at.insert(leaf_path.clone(), h_old).is_some() {
             return Err(DeltaVerifyError::SeedCollision { path_bits: anchor_len });
@@ -439,56 +459,32 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         }
     }
 
-    // 3) Bubble up along frames using the same boundaries for OLD and NEW.
+    // Bubble up
     for fr in frames {
         let pb = bits(&fr.node_path);
+        let left_in_union = leaf_paths.iter().any(|lp| path_is_prefix(&fr.left_path, lp));
+        let right_in_union = leaf_paths.iter().any(|lp| path_is_prefix(&fr.right_path, lp));
+        if left_in_union && fr.left_outside_hash.is_some() {
+            return Err(DeltaVerifyError::InvalidOutsideHash { path_bits: pb, which: "left" });
+        }
+        if right_in_union && fr.right_outside_hash.is_some() {
+            return Err(DeltaVerifyError::InvalidOutsideHash { path_bits: pb, which: "right" });
+        }
 
-        // OLD
-        let lo = if let Some(h) = old_at.remove(&fr.left_path) {
-            h
-        } else if let Some(h) = fr.left_outside_hash {
-            h
-        } else {
-            return Err(DeltaVerifyError::MissingChildOld { parent_bits: pb, which: "left" });
-        };
-        let ro = if let Some(h) = old_at.remove(&fr.right_path) {
-            h
-        } else if let Some(h) = fr.right_outside_hash {
-            h
-        } else {
-            return Err(DeltaVerifyError::MissingChildOld { parent_bits: pb, which: "right" });
-        };
-
-        // NEW
-        let ln = if let Some(h) = new_at.remove(&fr.left_path) {
-            h
-        } else if let Some(h) = fr.left_outside_hash {
-            h
-        } else {
-            return Err(DeltaVerifyError::MissingChildNew { parent_bits: pb, which: "left" });
-        };
-        let rn = if let Some(h) = new_at.remove(&fr.right_path) {
-            h
-        } else if let Some(h) = fr.right_outside_hash {
-            h
-        } else {
-            return Err(DeltaVerifyError::MissingChildNew { parent_bits: pb, which: "right" });
-        };
+        let lo = old_at.remove(&fr.left_path).unwrap_or(fr.left_outside_hash.unwrap_or(SPARSE_MERKLE_PLACEHOLDER_HASH));
+        let ro = old_at.remove(&fr.right_path).unwrap_or(fr.right_outside_hash.unwrap_or(SPARSE_MERKLE_PLACEHOLDER_HASH));
+        let ln = new_at.remove(&fr.left_path).unwrap_or(fr.left_outside_hash.unwrap_or(SPARSE_MERKLE_PLACEHOLDER_HASH));
+        let rn = new_at.remove(&fr.right_path).unwrap_or(fr.right_outside_hash.unwrap_or(SPARSE_MERKLE_PLACEHOLDER_HASH));
 
         let po = hash_internal_from_parts::<H>(&lo, &ro);
         let pn = hash_internal_from_parts::<H>(&ln, &rn);
+        println!("Frame: {:02x?}, Old: {:02x?}, New: {:02x?}", fr.node_path, po, pn);
 
         old_at.insert(fr.node_path.clone(), po);
         new_at.insert(fr.node_path, pn);
     }
 
-    // 4) Singletons + root check
-    fn singleton(map: &BTreeMap<Path, [u8; 32]>) -> Option<[u8; 32]> {
-        let mut it = map.values();
-        let h = *it.next()?;
-        if it.next().is_some() { return None; }
-        Some(h)
-    }
+    // Check roots
     let h0 = singleton(&old_at).ok_or_else(|| DeltaVerifyError::MultiRootOld(old_at.len()))?;
     let hf = singleton(&new_at).ok_or_else(|| DeltaVerifyError::MultiRootNew(new_at.len()))?;
     if h0 != r0.0 || hf != rf.0 {
