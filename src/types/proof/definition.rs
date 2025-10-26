@@ -29,16 +29,16 @@ pub struct SparseMerkleProof<H: SimpleHasher> {
     ///       empty.
     // Prevent serde from adding a spurious Serialize/Deserialize bound on H
     #[serde(bound(serialize = "", deserialize = ""))]
-    leaf: Option<SparseMerkleLeafNode>,
+    pub leaf: Option<SparseMerkleLeafNode>,
 
     /// All siblings in this proof, including the default ones. Siblings are ordered from the bottom
     /// level to the root level. The siblings contain the node type information to be able to efficiently
     /// coalesce on deletes.
-    siblings: Vec<SparseMerkleNode>,
+    pub siblings: Vec<SparseMerkleNode>,
 
     /// A marker type showing which hash function is used in this proof.
     #[borsh(bound(serialize = "", deserialize = ""))]
-    phantom_hasher: PhantomData<H>,
+    pub phantom_hasher: PhantomData<H>,
 }
 
 // Deriving Debug fails since H is not Debug though phantom_hasher implements it

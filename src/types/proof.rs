@@ -59,8 +59,8 @@ impl SparseMerkleNode {
 )]
 #[cfg_attr(all(test, feature = "std"), derive(Arbitrary))]
 pub struct SparseMerkleInternalNode {
-    left_child: [u8; 32],
-    right_child: [u8; 32],
+    pub left_child: [u8; 32],
+    pub right_child: [u8; 32],
 }
 
 impl SparseMerkleInternalNode {
@@ -83,8 +83,8 @@ impl SparseMerkleInternalNode {
 
 #[derive(Eq, Copy, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct SparseMerkleLeafNode {
-    key_hash: KeyHash,
-    value_hash: ValueHash,
+    pub key_hash: KeyHash,
+    pub value_hash: ValueHash,
 }
 
 // Manually implement Arbitrary to get the correct bounds. The derived Arbitrary impl adds a spurious
