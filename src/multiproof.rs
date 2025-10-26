@@ -29,6 +29,7 @@ pub enum DeltaVerifyError {
     FrameNormalization,
     MultipleConflictingKeys,
     InvalidOutsideHash { path_bits: usize, which: &'static str },
+    InvalidLeafPath { key: [u8;32], path: Vec<u8> },
     // We tried to seed the same anchor twice (shouldn't happen with grouping).
     SeedCollision { path_bits: usize },
     // A frame expected a child that was neither seeded (in-union) nor provided as an outside hash.
@@ -69,17 +70,6 @@ fn path_is_prefix(prefix: &Path, longer: &Path) -> bool {
         ok &= same;
     }
     ok
-}
-
-fn side_has_union(node_path: &Path, left_path: &Path, right_path: &Path, leaf_paths: &[Path]) -> (bool, bool) {
-    let mut has_left = false;
-    let mut has_right = false;
-    for lp in leaf_paths {
-        if path_is_prefix(left_path,  lp) { has_left  = true; }
-        if path_is_prefix(right_path, lp) { has_right = true; }
-        if has_left && has_right { break; }
-    }
-    (has_left, has_right)
 }
 
 fn scrub_outside_hashes_with_leaf_paths(
@@ -354,7 +344,7 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
 ) -> Result<(), DeltaVerifyError> {
     if proof.leaves.is_empty() { return Err(DeltaVerifyError::EmptyProof); }
 
-    // Validate conflicting keys and input consistency
+    // Validate conflicting keys and leaf paths
     let mut path_to_conf_key: BTreeMap<Path, Option<KeyHash>> = BTreeMap::new();
     for dl in &proof.leaves {
         if let Some(kc) = dl.conflicting_key {
@@ -364,6 +354,11 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         }
         if dl.old_value_hash.is_none() && dl.conflicting_key.is_none() && dl.old_base_at_leaf_path.is_some() {
             return Err(DeltaVerifyError::InvalidOutsideHash { path_bits: bits(&dl.leaf_path), which: "base" });
+        }
+        // Validate leaf_path
+        let expected_path = encode_prefix_from_key(bits(&dl.leaf_path), &dl.key);
+        if dl.leaf_path != expected_path {
+            return Err(DeltaVerifyError::InvalidLeafPath { key: dl.key.0, path: dl.leaf_path.clone() });
         }
     }
 
@@ -383,10 +378,21 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         }
     }
 
-    // Group and seed anchors
+    // Group keys by leaf_path, merging shared subtrees
     let mut groups: BTreeMap<Path, Vec<&DeltaLeaf>> = BTreeMap::new();
     for dl in &proof.leaves {
-        groups.entry(dl.leaf_path.clone()).or_default().push(dl);
+        let mut group_path = dl.leaf_path.clone();
+        // If conflicting_key exists and is in the batch, use common prefix
+        if let Some(kc) = dl.conflicting_key {
+            if proof.leaves.iter().any(|other| other.key == kc) {
+                // Find common prefix length
+                let key_bits = bits(&dl.leaf_path);
+                let conf_bits = proof.leaves.iter().find(|other| other.key == kc).map(|other| bits(&other.leaf_path)).unwrap_or(key_bits);
+                let common_len = key_bits.min(conf_bits);
+                group_path = encode_prefix_from_key(common_len, &dl.key);
+            }
+        }
+        groups.entry(group_path).or_default().push(dl);
     }
 
     let mut old_at: BTreeMap<Path, [u8; 32]> = BTreeMap::new();
@@ -396,59 +402,57 @@ pub fn verify_delta_multiproof_debug<H: SimpleHasher>(
         let anchor_len = bits(&leaf_path);
         let mut old_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
         let mut new_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
-        let mut conf_key: Option<KeyHash> = None;
-        let mut conf_old: Option<[u8;32]> = None;
+        let conf_key = path_to_conf_key.get(&leaf_path).cloned().flatten();
 
+        // Add conflicting key to old_pairs and new_pairs
+        if let Some(kc) = conf_key {
+            if let Some(hc_old) = proof.leaves.iter().find(|dl| dl.key == kc).and_then(|dl| dl.old_value_hash) {
+                old_pairs.push((kc, hc_old));
+                if let Some(hc_new) = new_leaf_by_key.get(&kc) {
+                    new_pairs.push((kc, *hc_new));
+                } else {
+                    new_pairs.push((kc, hc_old));
+                }
+            } else if let Some(base) = proof.leaves.iter().find(|dl| dl.conflicting_key == Some(kc)).and_then(|dl| dl.old_base_at_leaf_path) {
+                old_pairs.push((kc, base));
+                new_pairs.push((kc, base));
+            }
+        }
+
+        // Add updated keys
         for dl in &dls {
             if let Some(vh_old) = dl.old_value_hash {
                 old_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_old)));
-            } else if let (Some(base), Some(kc)) = (dl.old_base_at_leaf_path, dl.conflicting_key) {
-                // Only add the conflicting leaf once per anchor
-                if conf_key.is_none() {
-                    conf_key = Some(kc);
-                    conf_old = Some(base);
-                    old_pairs.push((kc, base));
-                }
             }
-            // empty-subtree variant contributes nothing to OLD
+            if let Some(vh_new) = dl.new_value_hash {
+                let new_hash = new_leaf_by_key.get(&dl.key).expect("New hash missing");
+                new_pairs.push((dl.key, *new_hash));
+            }
         }
 
-        let r_old_pairs = old_pairs.clone();
+        // Deduplicate pairs
+        old_pairs.sort_unstable_by_key(|(k, _)| k.0);
+        old_pairs.dedup_by_key(|(k, _)| k.0);
+        new_pairs.sort_unstable_by_key(|(k, _)| k.0);
+        new_pairs.dedup_by_key(|(k, _)| k.0);
 
         let h_old = if old_pairs.is_empty() {
             SPARSE_MERKLE_PLACEHOLDER_HASH
         } else if old_pairs.len() == 1 {
             old_pairs[0].1
         } else {
-            subtree_root_for_keys::<H>(anchor_len, old_pairs)
+            subtree_root_for_keys::<H>(anchor_len, old_pairs.clone())
         };
-
-        // NEW
-        let mut new_pairs: Vec<(KeyHash, [u8;32])> = Vec::new();
-
-        // If a conflicting leaf existed at OLD, include it at NEW with updated hash if it changed.
-        if let (Some(kc), Some(hc_old)) = (conf_key, conf_old) {
-            let hc_new = new_leaf_by_key.get(&kc).copied().unwrap_or(hc_old);
-            new_pairs.push((kc, hc_new));
-        }
-        for dl in &dls {
-            if let Some(vh_new) = dl.new_value_hash {
-                new_pairs.push((dl.key, hash_leaf_from_parts::<H>(&dl.key, &vh_new)));
-            }
-            // delete contributes nothing
-        }
-
-        let r_new_pairs = new_pairs.clone();
         let h_new = if new_pairs.is_empty() {
             SPARSE_MERKLE_PLACEHOLDER_HASH
         } else if new_pairs.len() == 1 {
             new_pairs[0].1
         } else {
-            subtree_root_for_keys::<H>(anchor_len, new_pairs)
+            subtree_root_for_keys::<H>(anchor_len, new_pairs.clone())
         };
 
-        println!("Anchor: {:02x?}, Old pairs: {:?}", leaf_path.clone(), r_old_pairs);
-        println!("Anchor: {:02x?}, New pairs: {:?}", leaf_path.clone(), r_new_pairs);
+        println!("Anchor: {:02x?}, Old pairs: {:?}", leaf_path, old_pairs);
+        println!("Anchor: {:02x?}, New pairs: {:?}", leaf_path, new_pairs);
         println!("Old: {:02x?}, New: {:02x?}", h_old, h_new);
 
         if old_at.insert(leaf_path.clone(), h_old).is_some() {
