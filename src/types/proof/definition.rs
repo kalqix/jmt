@@ -513,7 +513,9 @@ impl<H: SimpleHasher> SparseMerkleProof<H> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct UpdateMerkleProof<H: SimpleHasher>(
-    #[borsh(bound(serialize = "", deserialize = ""))] Vec<SparseMerkleProof<H>>,
+    #[borsh(bound(serialize = "", deserialize = ""))]
+    #[serde(bound(serialize = "", deserialize = ""))]
+    Vec<SparseMerkleProof<H>>,
 );
 
 impl<H: SimpleHasher> UpdateMerkleProof<H> {
