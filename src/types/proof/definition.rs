@@ -16,7 +16,15 @@ use serde::{Deserialize, Serialize};
 
 /// A proof that can be used to authenticate an element in a Sparse Merkle Tree given trusted root
 /// hash. For example, `TransactionInfoToAccountProof` can be constructed on top of this structure.
-#[derive(Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
+#[derive(
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SparseMerkleProof<H: SimpleHasher> {
     /// This proof can be used to authenticate whether a given leaf exists in the tree or not.
     ///     - If this is `Some(leaf_node)`
@@ -38,6 +46,7 @@ pub struct SparseMerkleProof<H: SimpleHasher> {
 
     /// A marker type showing which hash function is used in this proof.
     #[borsh(bound(serialize = "", deserialize = ""))]
+    #[rkyv(with = rkyv::with::Skip)]
     pub phantom_hasher: PhantomData<H>,
 }
 
@@ -511,7 +520,121 @@ impl<H: SimpleHasher> SparseMerkleProof<H> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
+impl<H: SimpleHasher> ArchivedSparseMerkleProof<H> {
+    /// Returns the list of siblings in this archived proof.
+    pub fn siblings(&self) -> &[super::ArchivedSparseMerkleNode] {
+        self.siblings.as_slice()
+    }
+
+    /// Verifies an existence proof directly against the zero-copy archived representation,
+    /// without deserializing into a `SparseMerkleProof<H>`.
+    pub fn verify_existence<V: AsRef<[u8]>>(
+        &self,
+        expected_root_hash: RootHash,
+        element_key: KeyHash,
+        element_value: V,
+    ) -> Result<()> {
+        self.verify(expected_root_hash, element_key, Some(element_value))
+    }
+
+    /// Verifies a non-inclusion proof directly against the zero-copy archived representation.
+    pub fn verify_nonexistence(
+        &self,
+        expected_root_hash: RootHash,
+        element_key: KeyHash,
+    ) -> Result<()> {
+        self.verify(expected_root_hash, element_key, None::<&[u8]>)
+    }
+
+    /// Matches [`SparseMerkleProof::verify`] semantics but operates on archived (zero-copy) data.
+    pub fn verify<V: AsRef<[u8]>>(
+        &self,
+        expected_root_hash: RootHash,
+        element_key: KeyHash,
+        element_value: Option<V>,
+    ) -> Result<()> {
+        ensure!(
+            self.siblings.len() <= 256,
+            "Sparse Merkle Tree proof has more than {} ({}) siblings.",
+            256,
+            self.siblings.len(),
+        );
+
+        match (element_value, &self.leaf) {
+            (Some(value), rkyv::option::ArchivedOption::Some(leaf)) => {
+                ensure!(
+                    element_key.0 == leaf.key_hash.0,
+                    "Keys do not match. Key in proof: {:?}. Expected key: {:?}.",
+                    leaf.key_hash.0,
+                    element_key.0
+                );
+                let hash: ValueHash = ValueHash::with::<H>(value);
+                ensure!(
+                    hash.0 == leaf.value_hash.0,
+                    "Value hashes do not match. Value hash in proof: {:?}. \
+                     Expected value hash: {:?}",
+                    leaf.value_hash.0,
+                    hash.0,
+                );
+            }
+            (Some(_), rkyv::option::ArchivedOption::None) => {
+                bail!("Expected inclusion proof. Found non-inclusion proof.")
+            }
+            (None, rkyv::option::ArchivedOption::Some(leaf)) => {
+                ensure!(
+                    element_key.0 != leaf.key_hash.0,
+                    "Expected non-inclusion proof, but key exists in proof.",
+                );
+                ensure!(
+                    element_key.0.common_prefix_bits_len(&leaf.key_hash.0) >= self.siblings.len(),
+                    "Key would not have ended up in the subtree where the provided key in proof \
+                     is the only existing key, if it existed. So this is not a valid \
+                     non-inclusion proof.",
+                );
+            }
+            (None, rkyv::option::ArchivedOption::None) => {}
+        }
+
+        let current_hash = match &self.leaf {
+            rkyv::option::ArchivedOption::Some(leaf) => leaf.hash::<H>(),
+            rkyv::option::ArchivedOption::None => SPARSE_MERKLE_PLACEHOLDER_HASH,
+        };
+
+        let depth = self.siblings.len();
+        let actual_root_hash = self
+            .siblings
+            .iter()
+            .zip(element_key.0.iter_bits().rev().skip(256 - depth))
+            .fold(current_hash, |hash, (sibling_node, bit)| {
+                if bit {
+                    SparseMerkleInternalNode::new(sibling_node.hash::<H>(), hash).hash::<H>()
+                } else {
+                    SparseMerkleInternalNode::new(hash, sibling_node.hash::<H>()).hash::<H>()
+                }
+            });
+
+        ensure!(
+            actual_root_hash == expected_root_hash.0,
+            "Root hashes do not match. Actual root hash: {:?}. Expected root hash: {:?}.",
+            actual_root_hash,
+            expected_root_hash.0,
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct UpdateMerkleProof<H: SimpleHasher>(
     #[borsh(bound(serialize = "", deserialize = ""))]
     #[serde(bound(serialize = "", deserialize = ""))]
@@ -595,11 +718,21 @@ impl<H: SimpleHasher> UpdateMerkleProof<H> {
 ///
 /// if the proof wants show that `[a, b, c, d, e]` exists in the tree, it would need the siblings
 /// `X` and `h` on the right.
-#[derive(Eq, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
+#[derive(
+    Eq,
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SparseMerkleRangeProof<H: SimpleHasher> {
     /// The vector of siblings on the right of the path from root to last leaf. The ones near the
     /// bottom are at the beginning of the vector. In the above example, it's `[X, h]`.
     right_siblings: Vec<SparseMerkleNode>,
+    #[rkyv(with = rkyv::with::Skip)]
     _phantom: PhantomData<H>,
 }
 

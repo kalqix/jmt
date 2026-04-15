@@ -177,7 +177,11 @@ use proptest_derive::Arbitrary;
     Deserialize,
     borsh::BorshSerialize,
     borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
+#[rkyv(derive(Debug, PartialEq, Eq), compare(PartialEq))]
 #[cfg_attr(any(test), derive(Arbitrary))]
 pub struct RootHash(pub [u8; 32]);
 
@@ -219,6 +223,13 @@ impl AsRef<[u8]> for RootHash {
     Deserialize,
     borsh::BorshSerialize,
     borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(
+    derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Copy, Clone),
+    compare(PartialEq, PartialOrd),
 )]
 #[cfg_attr(any(test), derive(Arbitrary))]
 pub struct KeyHash(pub [u8; 32]);
@@ -235,6 +246,13 @@ pub struct KeyHash(pub [u8; 32]);
     Deserialize,
     borsh::BorshSerialize,
     borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(
+    derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Copy, Clone),
+    compare(PartialEq, PartialOrd),
 )]
 #[cfg_attr(any(test), derive(Arbitrary))]
 // This needs to be public for the fuzzing/Arbitrary feature, but we don't

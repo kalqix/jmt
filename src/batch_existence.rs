@@ -17,7 +17,17 @@ use crate::{
 
 /// A batch of existence proofs to verify against the same root.
 /// Entries are individual `SparseMerkleProof`s with their key and value.
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound(serialize = "", deserialize = ""))]
 pub struct BatchExistenceProof<H: SimpleHasher> {
     // Borsh derive otherwise adds a spurious `H: BorshSerialize` bound; the
@@ -27,7 +37,17 @@ pub struct BatchExistenceProof<H: SimpleHasher> {
     pub entries: Vec<BatchExistenceEntry<H>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound(serialize = "", deserialize = ""))]
 pub struct BatchExistenceEntry<H: SimpleHasher> {
     pub key_hash: KeyHash,
@@ -122,6 +142,110 @@ impl<H: SimpleHasher> BatchExistenceProof<H> {
                 // (depth - 1 - i) bits of the key hash (MSB-first).
                 let level_from_root = depth - 1 - i;
                 let cache_key = encode_cache_key(level_from_root, &entry.key_hash.0);
+
+                if let Some(&cached_hash) = cache.get(&cache_key) {
+                    ensure!(
+                        current_hash == cached_hash,
+                        "Entry {}: hash mismatch at level {} from root. \
+                         Computed {:?}, cached {:?}.",
+                        entry_idx,
+                        level_from_root,
+                        current_hash,
+                        cached_hash
+                    );
+                    early_exit = true;
+                    break;
+                } else {
+                    cache.insert(cache_key, current_hash);
+                }
+            }
+
+            if !early_exit {
+                ensure!(
+                    current_hash == expected_root.0,
+                    "Entry {}: root hash mismatch. Computed {:?}, expected {:?}",
+                    entry_idx,
+                    current_hash,
+                    expected_root.0
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl<H: SimpleHasher> ArchivedBatchExistenceProof<H> {
+    /// Verify all entries exist in the tree with the given root, operating directly on
+    /// the zero-copy archived representation. Logic and semantics match
+    /// [`BatchExistenceProof::verify`] exactly, including intermediate hash caching.
+    pub fn verify(&self, expected_root: RootHash) -> Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut cache: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+        let root_key = encode_cache_key(0, &[0u8; 32]);
+        cache.insert(root_key, expected_root.0);
+
+        for (entry_idx, entry) in self.entries.iter().enumerate() {
+            let leaf = match &entry.proof.leaf {
+                rkyv::option::ArchivedOption::Some(l) => l,
+                rkyv::option::ArchivedOption::None => {
+                    anyhow::bail!("Entry {}: missing leaf in existence proof", entry_idx)
+                }
+            };
+
+            ensure!(
+                entry.key_hash.0 == leaf.key_hash.0,
+                "Entry {}: key mismatch. Proof key: {:?}, expected: {:?}",
+                entry_idx,
+                leaf.key_hash.0,
+                entry.key_hash.0
+            );
+
+            let expected_value_hash = ValueHash::with::<H>(entry.value.as_slice());
+            ensure!(
+                expected_value_hash.0 == leaf.value_hash.0,
+                "Entry {}: value hash mismatch",
+                entry_idx
+            );
+
+            let depth = entry.proof.siblings.len();
+            ensure!(
+                depth <= 256,
+                "Entry {}: proof depth {} exceeds 256",
+                entry_idx,
+                depth
+            );
+
+            let mut current_hash = leaf.hash::<H>();
+
+            let key_bytes: [u8; 32] = entry.key_hash.0;
+            let bits: Vec<bool> = key_bytes.iter_bits().rev().skip(256 - depth).collect();
+
+            let mut early_exit = false;
+
+            for (i, sibling) in entry.proof.siblings.iter().enumerate() {
+                let bit = bits[i];
+                let sibling_hash = sibling.hash::<H>();
+
+                current_hash = if bit {
+                    SparseMerkleInternalNode::new(sibling_hash, current_hash).hash::<H>()
+                } else {
+                    SparseMerkleInternalNode::new(current_hash, sibling_hash).hash::<H>()
+                };
+
+                let level_from_root = depth - 1 - i;
+                let cache_key = encode_cache_key(level_from_root, &key_bytes);
 
                 if let Some(&cached_hash) = cache.get(&cache_key) {
                     ensure!(
@@ -371,6 +495,135 @@ mod tests {
         let batch_proof = BatchExistenceProof::<Sha256> { entries: vec![] };
         let root = RootHash([0u8; 32]);
         batch_proof.verify(root).expect("empty batch should pass");
+    }
+
+    #[test]
+    fn test_rkyv_roundtrip_key_hash() {
+        use rkyv::rancor::Error;
+        let kh = KeyHash([42u8; 32]);
+        let bytes = rkyv::to_bytes::<Error>(&kh).expect("serialize");
+        let archived =
+            rkyv::access::<crate::ArchivedKeyHash, Error>(&bytes[..]).expect("access");
+        assert_eq!(archived.0, [42u8; 32]);
+    }
+
+    #[test]
+    fn test_rkyv_roundtrip_sparse_merkle_node() {
+        use crate::proof::{ArchivedSparseMerkleNode, SparseMerkleInternalNode, SparseMerkleNode};
+        use rkyv::rancor::Error;
+
+        let node = SparseMerkleNode::Internal(SparseMerkleInternalNode::new([1u8; 32], [2u8; 32]));
+        let bytes = rkyv::to_bytes::<Error>(&node).expect("serialize");
+        let archived =
+            rkyv::access::<ArchivedSparseMerkleNode, Error>(&bytes[..]).expect("access");
+
+        match archived {
+            ArchivedSparseMerkleNode::Internal(n) => {
+                assert_eq!(n.left_child, [1u8; 32]);
+                assert_eq!(n.right_child, [2u8; 32]);
+            }
+            _ => panic!("expected Internal"),
+        }
+
+        assert_eq!(archived.hash::<Sha256>(), node.hash::<Sha256>());
+    }
+
+    #[test]
+    fn test_rkyv_archived_batch_existence_verifies() {
+        use rkyv::rancor::Error;
+
+        let store = MockTreeStore::default();
+        let tree = JellyfishMerkleTree::<_, Sha256>::new(&store);
+
+        let keys: Vec<KeyHash> = (0..10)
+            .map(|i| KeyHash::with::<Sha256>(format!("key_{}", i).as_bytes()))
+            .collect();
+        let values: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("value_{}", i).into_bytes())
+            .collect();
+
+        let mut v0 = BTreeMap::new();
+        for (k, v) in keys.iter().zip(values.iter()) {
+            v0.insert(*k, Some(v.clone()));
+        }
+
+        let (root, batch) = tree.put_value_set(v0, 0).expect("insert");
+        store.write_tree_update_batch(batch).expect("write");
+
+        let mut entries = Vec::new();
+        for (k, v) in keys.iter().zip(values.iter()) {
+            let (_, proof) = tree.get_with_proof(*k, 0).expect("get_with_proof");
+            entries.push((*k, v.clone(), proof));
+        }
+
+        let batch_proof = build_batch_existence_proof::<Sha256>(entries);
+        batch_proof.verify(root).expect("concrete batch verify");
+
+        let bytes = rkyv::to_bytes::<Error>(&batch_proof).expect("rkyv serialize");
+        let archived =
+            rkyv::access::<ArchivedBatchExistenceProof<Sha256>, Error>(&bytes[..])
+                .expect("rkyv access");
+
+        archived
+            .verify(root)
+            .expect("archived batch verify should pass");
+    }
+
+    #[test]
+    fn test_rkyv_archived_batch_existence_wrong_root_fails() {
+        use rkyv::rancor::Error;
+
+        let store = MockTreeStore::default();
+        let tree = JellyfishMerkleTree::<_, Sha256>::new(&store);
+
+        let key = KeyHash::with::<Sha256>(b"test_key");
+        let value = b"value".to_vec();
+
+        let mut v0 = BTreeMap::new();
+        v0.insert(key, Some(value.clone()));
+
+        let (_root, batch) = tree.put_value_set(v0, 0).expect("insert");
+        store.write_tree_update_batch(batch).expect("write");
+
+        let (_, proof) = tree.get_with_proof(key, 0).expect("get_with_proof");
+        let batch_proof = build_batch_existence_proof::<Sha256>(vec![(key, value, proof)]);
+
+        let bytes = rkyv::to_bytes::<Error>(&batch_proof).expect("rkyv serialize");
+        let archived =
+            rkyv::access::<ArchivedBatchExistenceProof<Sha256>, Error>(&bytes[..])
+                .expect("rkyv access");
+
+        let wrong_root = RootHash([99u8; 32]);
+        assert!(archived.verify(wrong_root).is_err());
+    }
+
+    #[test]
+    fn test_rkyv_archived_individual_proof_verifies() {
+        use crate::proof::ArchivedSparseMerkleProof;
+        use rkyv::rancor::Error;
+
+        let store = MockTreeStore::default();
+        let tree = JellyfishMerkleTree::<_, Sha256>::new(&store);
+
+        let key = KeyHash::with::<Sha256>(b"hello");
+        let value = b"world".to_vec();
+
+        let mut v0 = BTreeMap::new();
+        v0.insert(key, Some(value.clone()));
+
+        let (root, batch) = tree.put_value_set(v0, 0).expect("insert");
+        store.write_tree_update_batch(batch).expect("write");
+
+        let (_, proof) = tree.get_with_proof(key, 0).expect("get_with_proof");
+
+        let bytes = rkyv::to_bytes::<Error>(&proof).expect("rkyv serialize");
+        let archived =
+            rkyv::access::<ArchivedSparseMerkleProof<Sha256>, Error>(&bytes[..])
+                .expect("rkyv access");
+
+        archived
+            .verify_existence(root, key, &value)
+            .expect("archived individual verify");
     }
 
     #[test]

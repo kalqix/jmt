@@ -38,6 +38,7 @@ blake3 = { version = "1.4.0", optional = true, features = ["traits-preview"] }
 hex = "0.4"
 tracing = "0.1"
 ics23 = { version = "0.12.0", optional = true}
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 
 [dev-dependencies]
 hex = { version = "0.4", features = ["serde"] }

@@ -15,7 +15,10 @@ use crate::{
 #[cfg(all(test, feature = "std"))]
 use proptest_derive::Arbitrary;
 
-pub use self::definition::{SparseMerkleProof, SparseMerkleRangeProof, UpdateMerkleProof};
+pub use self::definition::{
+    ArchivedSparseMerkleProof, ArchivedSparseMerkleRangeProof, ArchivedUpdateMerkleProof,
+    SparseMerkleProof, SparseMerkleRangeProof, UpdateMerkleProof,
+};
 use crate::{KeyHash, ValueHash, SPARSE_MERKLE_PLACEHOLDER_HASH};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -25,8 +28,20 @@ pub const INTERNAL_DOMAIN_SEPARATOR: &[u8] = b"JMT::IntrnalNode";
 
 #[cfg_attr(all(test, feature = "std"), derive(Arbitrary))]
 #[derive(
-    Serialize, Deserialize, Clone, Copy, Eq, PartialEq, BorshSerialize, BorshDeserialize, Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
+#[rkyv(derive(Debug), compare(PartialEq))]
 /// A [`SparseMerkleNode`] is either a null node, an internal sparse node or a leaf node.
 /// This is useful in the delete case to know if we need to coalesce the leaves on deletion.
 /// The [`SparseMerkleNode`] needs to store either a [`SparseMerkleInternalNode`] or a [`SparseMerkleLeafNode`]
@@ -54,9 +69,33 @@ impl SparseMerkleNode {
     }
 }
 
+impl ArchivedSparseMerkleNode {
+    /// Compute the hash of this node directly from its archived (zero-copy) form.
+    /// Produces the exact same bytes as [`SparseMerkleNode::hash`] on the unarchived equivalent.
+    pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
+        match self {
+            ArchivedSparseMerkleNode::Null => SPARSE_MERKLE_PLACEHOLDER_HASH,
+            ArchivedSparseMerkleNode::Internal(node) => node.hash::<H>(),
+            ArchivedSparseMerkleNode::Leaf(node) => node.hash::<H>(),
+        }
+    }
+}
+
 #[derive(
-    Serialize, Deserialize, Clone, Copy, Eq, PartialEq, BorshSerialize, BorshDeserialize, Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    BorshSerialize,
+    BorshDeserialize,
+    Debug,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
+#[rkyv(derive(Debug), compare(PartialEq))]
 #[cfg_attr(all(test, feature = "std"), derive(Arbitrary))]
 pub struct SparseMerkleInternalNode {
     pub left_child: [u8; 32],
@@ -81,7 +120,29 @@ impl SparseMerkleInternalNode {
     }
 }
 
-#[derive(Eq, Copy, Serialize, Deserialize, borsh::BorshSerialize, borsh::BorshDeserialize)]
+impl ArchivedSparseMerkleInternalNode {
+    /// Compute the hash of this internal node directly from its archived (zero-copy) form.
+    pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
+        let mut hasher = H::new();
+        hasher.update(INTERNAL_DOMAIN_SEPARATOR);
+        hasher.update(&self.left_child);
+        hasher.update(&self.right_child);
+        hasher.finalize()
+    }
+}
+
+#[derive(
+    Eq,
+    Copy,
+    Serialize,
+    Deserialize,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(derive(Debug), compare(PartialEq))]
 pub struct SparseMerkleLeafNode {
     pub key_hash: KeyHash,
     pub value_hash: ValueHash,
@@ -147,6 +208,17 @@ impl SparseMerkleLeafNode {
         self.key_hash
     }
 
+    pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
+        let mut hasher = H::new();
+        hasher.update(LEAF_DOMAIN_SEPARATOR);
+        hasher.update(&self.key_hash.0);
+        hasher.update(&self.value_hash.0);
+        hasher.finalize()
+    }
+}
+
+impl ArchivedSparseMerkleLeafNode {
+    /// Compute the hash of this leaf directly from its archived (zero-copy) form.
     pub fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
         let mut hasher = H::new();
         hasher.update(LEAF_DOMAIN_SEPARATOR);
