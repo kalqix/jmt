@@ -92,6 +92,7 @@ mod writer;
 mod multiproof;
 
 pub mod batch_existence;
+pub mod flat_proof;
 
 #[cfg(any(test, feature = "mocks"))]
 pub mod mock;
@@ -113,6 +114,10 @@ pub use multiproof::*;
 
 pub use batch_existence::{
     build_batch_existence_proof, BatchExistenceEntry, BatchExistenceProof,
+};
+
+pub use flat_proof::{
+    verify_flat_existence, FlatBatchExistenceProof, FlatExistenceEntry,
 };
 
 /// Contains types used to bridge a [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
