@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 use anyhow::{ensure, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
@@ -16,17 +17,22 @@ use crate::{
 
 /// A batch of existence proofs to verify against the same root.
 /// Entries are individual `SparseMerkleProof`s with their key and value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(bound(serialize = "", deserialize = ""))]
 pub struct BatchExistenceProof<H: SimpleHasher> {
+    // Borsh derive otherwise adds a spurious `H: BorshSerialize` bound; the
+    // actual serialization depends only on `SparseMerkleProof<H>` (whose own
+    // borsh impl is H-free thanks to the phantom bound override).
+    #[borsh(bound(serialize = "", deserialize = ""))]
     pub entries: Vec<BatchExistenceEntry<H>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(bound(serialize = "", deserialize = ""))]
 pub struct BatchExistenceEntry<H: SimpleHasher> {
     pub key_hash: KeyHash,
     pub value: Vec<u8>,
+    #[borsh(bound(serialize = "", deserialize = ""))]
     pub proof: SparseMerkleProof<H>,
 }
 
