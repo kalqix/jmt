@@ -91,6 +91,8 @@ mod writer;
 
 mod multiproof;
 
+pub mod batch_existence;
+
 #[cfg(any(test, feature = "mocks"))]
 pub mod mock;
 pub mod restore;
@@ -108,6 +110,10 @@ pub use types::proof;
 pub use types::Version;
 
 pub use multiproof::*;
+
+pub use batch_existence::{
+    build_batch_existence_proof, BatchExistenceEntry, BatchExistenceProof,
+};
 
 /// Contains types used to bridge a [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
 /// to the backing storage recording the tree's internal data.
